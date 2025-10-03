@@ -1,8 +1,10 @@
 import os
 import sys
-from datasets import load_dataset
+from functools import partial
+
 sys.path.append("./models")
 import numpy as np
+import pickle
 import matplotlib.pyplot as plt
 import cv2
 from PIL import Image
@@ -43,7 +45,7 @@ output_dir = os.path.join(current_dir, "images")
 os.makedirs(output_dir, exist_ok=True)
 
 # ===> specify the model path
-model_path = "liuhaotian/llava-v1.5-7b"
+model_path = "/mnt/scratch-artemis/gviveiros/TowerVision/llava-next-native/towerp_2b_base_full/"
 
 # load the model
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -52,16 +54,31 @@ disable_torch_init()
 
 model_name = get_model_name_from_path(model_path)
 
+print("Model name: ", model_name)
+print("Model path: ", model_path)
+
+llava_args = {
+    "multimodal": True,
+    "attn_implementation": "eager" #"sdpa" if torch.version.cuda and torch.__version__ >= "2.1.2" else "eager"
+}
+
 tokenizer, model, image_processor, context_len = load_pretrained_model(
     model_path,
     None,
     model_name,
     device_map=device,
-    attn_implementation="eager"
+    torch_dtype="bfloat16",
+    **llava_args
 )
 model.to(device)
 
 
+
+# ===> specify the image path or url and the prompt text
+image_path_or_url = (
+    "https://github.com/open-compass/MMBench/blob/main/samples/MMBench/1.jpg?raw=true"
+)
+prompt_text = "What code can be used to generate the output in the image?"
 
 ################################################
 # preparation for the generation
@@ -76,6 +93,8 @@ elif "v1" in model_name.lower():
     conv_mode = "llava_v1"
 elif "mpt" in model_name.lower():
     conv_mode = "mpt"
+elif "tower" in model_name.lower():
+    conv_mode = "gemma2_instruct"
 else:
     conv_mode = "llava_v0"
 
@@ -85,23 +104,7 @@ if "mpt" in model_name.lower():
 else:
     roles = conv.roles
 
-
-# ===> specify the image path or url and the prompt text
-#image_path_or_url = (
-#    "https://github.com/open-compass/MMBench/blob/main/samples/MMBench/1.jpg?raw=true"
-#)
-# prompt_text = "What python code can be used to generate the output in the image?"
-
-# load example from commute
-ds = load_dataset("Unbabel/commute_multimodal_mt")
-sample = ds["fr"][16]
-import pdb; pdb.set_trace()
-image = sample["image"].convert("RGB")
-# save original image
-image.save(os.path.join(output_dir, "original_image.png"))
-prompt_text = "Translate the following sentence from English to French: " + sample["source"]
-
-#image = load_image(image_path_or_url)
+image = load_image(image_path_or_url)
 image_size = image.size
 print("Image size: ", image_size)
 # image_tensor, images = process_images([image], image_processor, model.config)
@@ -112,7 +115,7 @@ if type(images) is list:
         image.to(model.device, dtype=torch.float16) for image in images
     ]
 else:
-    image_tensor = images.to(model.device, dtype=torch.float16)
+    image_tensor = images.to(model.device, dtype=torch.bfloat16)
 
 if model.config.mm_use_im_start_end:
     inp = (
@@ -127,13 +130,16 @@ else:
 
 conv.append_message(conv.roles[0], inp)
 conv.append_message(conv.roles[1], None)
+
 prompt = conv.get_prompt()
-# manually removing the system prompt here
-# otherwise most attention will be somehow put on the system prompt
-prompt = prompt.replace(
-    "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. ",
-    "",
-)
+
+def pad_sequence(input_ids, batch_first, padding_value):
+    if tokenizer.padding_side == "left":
+        input_ids = [torch.flip(_input_ids, [0]) for _input_ids in input_ids]
+    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=batch_first, padding_value=padding_value)
+    if tokenizer.padding_side == "left":
+        input_ids = torch.flip(input_ids, [1])
+    return input_ids
 
 input_ids = (
     tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
@@ -142,38 +148,88 @@ input_ids = (
 )
 ################################################
 
+# pad the input ids
+pad_token_ids = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+input_ids = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_ids).to(device)
+attention_masks = input_ids.ne(pad_token_ids).to(device)
+attention_masks = attention_masks.to(device)
+
+# carefull here, ensure that no system prompt is added
 print("Prompt: ", prompt)
 
-
+pad_token_ids = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 # ---
 # generate the response
+torch._inductor.cudagraph_mark_step_begin()
 with torch.inference_mode():
     outputs = model.generate(
         input_ids,
+        attention_mask=attention_masks,
         images=image_tensor,
         image_sizes=[image_size],
         do_sample=False,
         max_new_tokens=512,
+        eos_token_id=107,
+        pad_token_id=pad_token_ids,
         use_cache=True,
         return_dict_in_generate=True,
         output_attentions=True,
     )
 
+# lets save the outputs
+# outputs_file = os.path.join(output_dir, "outputs.pkl")
+# with open(outputs_file, "wb") as f:
+#     pickle.dump(outputs["sequences"].detach().cpu().numpy(), f)
+#     pickle.dump(outputs["attentions"].detach().cpu().numpy(), f)
+
+# import pdb; pdb.set_trace()
+# # read back the outputs
+# with open(outputs_file, "rb") as f:
+#     outputs["sequences"] = torch.from_numpy(pickle.load(f)).to(device)
+#     outputs["attentions"] = torch.from_numpy(pickle.load(f)).to(device)
+
 text = tokenizer.decode(outputs["sequences"][0]).strip()
+# how much tokens on the output tokens?
+print("Number of output tokens: ", len(outputs["sequences"][0]))
 print(text)
+
 # ---
 print("Constructing the LLM attention matrix...")
-print("Length of the LLM attention matrix: ", len(outputs["attentions"]))
+print("Number of layers: ", len(outputs["attentions"][0]))
 for i, token in enumerate(outputs["attentions"]):
     print(f"Token {i} shape: {token[0].shape}")
+    # gemma2 uses maximum context length during the generation (4096 tokens)
+
+
+# FIXME
+# gemma2 uses sliding window & global attention, so we need to pad the vectors into max_length
+# lets replace outputs[0] by a new version padded with maxsize
+max_length = max(attention.shape[-1] for attention in outputs["attentions"][0])
+new_attentions = []
+# clone the attentions and detach them
+for idx, attention in enumerate(outputs["attentions"]): # for each output token
+    padded_attentions = []
+    for idx_,layer_attn in enumerate(attention):
+        pad_len = max_length - layer_attn.shape[-1]
+        if pad_len > 0:
+            pad_shape = (*layer_attn.shape[:-1], pad_len)
+            padding = torch.zeros(pad_shape, device=layer_attn.device, dtype=layer_attn.dtype)
+            padded_attention = torch.cat([layer_attn, padding], dim=-1)
+        else:
+            padded_attention = layer_attn
+        padded_attentions.append(padded_attention)
+    new_attentions.append(padded_attentions)
+
+outputs["padded_attentions"] = tuple(new_attentions)
 
 
 # constructing the llm attention matrix
 aggregated_prompt_attention = []
-for i, layer in enumerate(outputs["attentions"][0]):
+for i, layer in enumerate(outputs["padded_attentions"][0]):
     layer_attns = layer.squeeze(0)
     attns_per_head = layer_attns.mean(dim=0)
     cur = attns_per_head[:-1].cpu().clone()
+    
     # following the practice in `aggregate_llm_attention`
     # we are zeroing out the attention to the first <bos> token
     # for the first row `cur[0]` (corresponding to the next token after <bos>), however,
@@ -183,28 +239,27 @@ for i, layer in enumerate(outputs["attentions"][0]):
     aggregated_prompt_attention.append(cur)
 
 print("Attention for every layer aggregated, for the prompt attention sequence")
-print("We have", len(aggregated_prompt_attention), "attention values")
+print("We have", len(aggregated_prompt_attention), "attention heads")
 print(
-    "Each attention value is of shape: ",
+    "Each attention head is of shape: ",
     aggregated_prompt_attention[0].shape,
     " we removed the last row because it is the <eos> token",
 )
 
-import pdb; pdb.set_trace()
 aggregated_prompt_attention = torch.stack(aggregated_prompt_attention).mean(dim=0)
-
 print("Aggregated prompt attention shape: ", aggregated_prompt_attention.shape)
+
 
 # llm_attn_matrix will be of torch.Size([N, N])
 # where N is the total number of input (both image and text ones) + output tokens
 llm_attn_matrix = heterogenous_stack(
     [torch.tensor([1])]
     + list(aggregated_prompt_attention)
-    + list(map(aggregate_llm_attention, outputs["attentions"]))
+    + list(map(aggregate_llm_attention, outputs["padded_attentions"]))
 )
 
 # ---
-import pdb; pdb.set_trace()
+
 # visualize the llm attention matrix
 # ===> adjust the gamma factor to enhance the visualization
 #      higer gamma brings out more low attention values
@@ -225,7 +280,7 @@ plt.savefig(
 )
 plt.close()
 
-# ---
+# ---   
 
 # identify length or index of tokens
 input_token_len = (
@@ -289,7 +344,7 @@ plt.close()
 # `all_prev_layers=True` will average attention from all layers until the selected layer
 # otherwise only the selected layer's attention will be used
 
-
+import pdb; pdb.set_trace()
 vis_attn_matrix = aggregate_vit_attention(
     model.get_vision_tower().image_attentions,
     select_layer=model.get_vision_tower().select_layer,
